@@ -39,13 +39,17 @@ import org.springframework.batch.item.database.JdbcBatchItemWriter;
 import org.springframework.batch.item.database.JdbcPagingItemReader;
 import org.springframework.batch.item.database.Order;
 import org.springframework.batch.item.database.support.MySqlPagingQueryProvider;
+import org.springframework.beans.BeansException;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.ApplicationContext;
+import org.springframework.context.ApplicationContextAware;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.task.SimpleAsyncTaskExecutor;
 import org.springframework.data.redis.connection.RedisConnectionFactory;
 import org.springframework.data.redis.listener.RedisMessageListenerContainer;
+import org.springframework.data.redis.serializer.JdkSerializationRedisSerializer;
 import org.springframework.integration.annotation.Aggregator;
 import org.springframework.integration.annotation.ServiceActivator;
 import org.springframework.integration.channel.DirectChannel;
@@ -63,7 +67,7 @@ import org.springframework.scheduling.support.PeriodicTrigger;
  * @author Michael Minella
  */
 @Configuration
-public class JobConfiguration {
+public class JobConfiguration implements ApplicationContextAware {
 
 	@Autowired
 	public JobBuilderFactory jobBuilderFactory;
@@ -76,6 +80,44 @@ public class JobConfiguration {
 
 	@Autowired
 	public JobExplorer jobExplorer;
+
+	private ApplicationContext applicationContext;
+
+	@Bean
+	@Aggregator(inputChannel = "inboundStaging", sendPartialResultsOnExpiry = "true", sendTimeout = "35000")
+	public PartitionHandler partitionHandler() throws Exception {
+		MessageChannelPartitionHandler partitionHandler = new MessageChannelPartitionHandler();
+
+		partitionHandler.setStepName("slaveStep");
+		partitionHandler.setGridSize(4);
+		partitionHandler.setMessagingOperations(messageTemplate());
+		partitionHandler.setReplyChannel(inboundStaging());
+
+		partitionHandler.afterPropertiesSet();
+
+		return partitionHandler;
+	}
+
+	@Bean
+	public ExecutorChannel outboundRequests() {
+		return MessageChannels.executor("outboundRequests", new SimpleAsyncTaskExecutor()).get();
+	}
+
+	@Bean
+	@ServiceActivator(inputChannel = "outboundRequests")
+	public RedisQueueOutboundGateway redisOutbound(RedisConnectionFactory connectionFactory) {
+		RedisQueueOutboundGateway gateway = new RedisQueueOutboundGateway("batch.requests", connectionFactory);
+
+		gateway.setOutputChannel(inboundStaging());
+		gateway.setReceiveTimeout(60000000);
+
+		return gateway;
+	}
+
+	@Bean
+	public PollableChannel inboundStaging() {
+		return new QueueChannel();
+	}
 
 	@Bean
 	public ColumnRangePartitioner partitioner() {
@@ -104,30 +146,11 @@ public class JobConfiguration {
 		RedisQueueInboundGateway inbound = new RedisQueueInboundGateway("batch.requests", connectionFactory);
 
 		inbound.setRequestChannel(inboundRequests());
-		inbound.setReceiveTimeout(60000000l);
 		inbound.setReplyChannel(outboundStaging());
+		inbound.setReceiveTimeout(60000000l);
+		inbound.setSerializer(new JdkSerializationRedisSerializer());
 
 		return inbound;
-	}
-
-	@Bean
-	@ServiceActivator(inputChannel = "outboundRequests")
-	public RedisQueueOutboundGateway redisOutbound(RedisConnectionFactory connectionFactory) {
-		RedisQueueOutboundGateway gateway = new RedisQueueOutboundGateway("batch.requests", connectionFactory);
-
-		gateway.setOutputChannel(inboundStaging());
-
-		return gateway;
-	}
-
-	@Bean
-	public ExecutorChannel outboundRequests() {
-		return MessageChannels.executor("executorChannel", new SimpleAsyncTaskExecutor()).get();
-	}
-
-	@Bean
-	public PollableChannel inboundStaging() {
-		return new QueueChannel();
 	}
 
 	@Bean
@@ -136,8 +159,8 @@ public class JobConfiguration {
 	}
 
 	@Bean
-	public DirectChannel inboundRequests() {
-		return new DirectChannel();
+	public QueueChannel inboundRequests() {
+		return new QueueChannel();
 	}
 
 	@Bean
@@ -146,7 +169,9 @@ public class JobConfiguration {
 		StepExecutionRequestHandler stepExecutionRequestHandler =
 				new StepExecutionRequestHandler();
 
-		stepExecutionRequestHandler.setStepLocator(new BeanFactoryStepLocator());
+		BeanFactoryStepLocator stepLocator = new BeanFactoryStepLocator();
+		stepLocator.setBeanFactory(this.applicationContext);
+		stepExecutionRequestHandler.setStepLocator(stepLocator);
 		stepExecutionRequestHandler.setJobExplorer(this.jobExplorer);
 
 		return stepExecutionRequestHandler;
@@ -166,21 +191,6 @@ public class JobConfiguration {
 		PollerMetadata pollerMetadata = new PollerMetadata();
 		pollerMetadata.setTrigger(new PeriodicTrigger(10));
 		return pollerMetadata;
-	}
-
-	@Bean
-	@Aggregator(inputChannel = "inboundStaging", sendPartialResultsOnExpiry = "true", sendTimeout = "60000000")
-	public PartitionHandler partitionHandler() throws Exception {
-		MessageChannelPartitionHandler partitionHandler = new MessageChannelPartitionHandler();
-
-		partitionHandler.setStepName("slaveStep");
-		partitionHandler.setGridSize(4);
-		partitionHandler.setMessagingOperations(messageTemplate());
-		partitionHandler.setReplyChannel(inboundStaging());
-
-		partitionHandler.afterPropertiesSet();
-
-		return partitionHandler;
 	}
 
 	@Bean
@@ -247,5 +257,10 @@ public class JobConfiguration {
 		return jobBuilderFactory.get("job")
 				.start(step1())
 				.build();
+	}
+
+	@Override
+	public void setApplicationContext(ApplicationContext applicationContext) throws BeansException {
+		this.applicationContext = applicationContext;
 	}
 }

@@ -24,6 +24,10 @@ import io.spring.batch.domain.ColumnRangePartitioner;
 import io.spring.batch.domain.Customer;
 import io.spring.batch.domain.CustomerRowMapper;
 
+import org.springframework.amqp.core.AmqpTemplate;
+import org.springframework.amqp.core.Queue;
+import org.springframework.amqp.rabbit.connection.ConnectionFactory;
+import org.springframework.amqp.rabbit.listener.SimpleMessageListenerContainer;
 import org.springframework.batch.core.Job;
 import org.springframework.batch.core.Step;
 import org.springframework.batch.core.configuration.annotation.JobBuilderFactory;
@@ -47,9 +51,9 @@ import org.springframework.context.ApplicationContextAware;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.task.SimpleAsyncTaskExecutor;
-import org.springframework.data.redis.connection.RedisConnectionFactory;
-import org.springframework.data.redis.listener.RedisMessageListenerContainer;
-import org.springframework.data.redis.serializer.JdkSerializationRedisSerializer;
+import org.springframework.integration.amqp.inbound.AmqpInboundGateway;
+import org.springframework.integration.amqp.outbound.AmqpOutboundEndpoint;
+import org.springframework.integration.amqp.support.DefaultAmqpHeaderMapper;
 import org.springframework.integration.annotation.Aggregator;
 import org.springframework.integration.annotation.ServiceActivator;
 import org.springframework.integration.channel.DirectChannel;
@@ -57,10 +61,7 @@ import org.springframework.integration.channel.ExecutorChannel;
 import org.springframework.integration.channel.QueueChannel;
 import org.springframework.integration.core.MessagingTemplate;
 import org.springframework.integration.dsl.channel.MessageChannels;
-import org.springframework.integration.redis.inbound.RedisQueueInboundGateway;
-import org.springframework.integration.redis.outbound.RedisQueueOutboundGateway;
 import org.springframework.integration.scheduling.PollerMetadata;
-import org.springframework.messaging.PollableChannel;
 import org.springframework.scheduling.support.PeriodicTrigger;
 
 /**
@@ -84,7 +85,7 @@ public class JobConfiguration implements ApplicationContextAware {
 	private ApplicationContext applicationContext;
 
 	@Bean
-	@Aggregator(inputChannel = "inboundStaging", sendPartialResultsOnExpiry = "true", sendTimeout = "35000")
+	@Aggregator(inputChannel = "inboundStaging", sendPartialResultsOnExpiry = "true", sendTimeout = "60000000")
 	public PartitionHandler partitionHandler() throws Exception {
 		MessageChannelPartitionHandler partitionHandler = new MessageChannelPartitionHandler();
 
@@ -99,24 +100,45 @@ public class JobConfiguration implements ApplicationContextAware {
 	}
 
 	@Bean
+	public MessagingTemplate messageTemplate() {
+		MessagingTemplate messagingTemplate = new MessagingTemplate(outboundRequests());
+
+		messagingTemplate.setReceiveTimeout(60000000l);
+
+		return messagingTemplate;
+	}
+
+	@Bean
 	public ExecutorChannel outboundRequests() {
 		return MessageChannels.executor("outboundRequests", new SimpleAsyncTaskExecutor()).get();
 	}
 
 	@Bean
 	@ServiceActivator(inputChannel = "outboundRequests")
-	public RedisQueueOutboundGateway redisOutbound(RedisConnectionFactory connectionFactory) {
-		RedisQueueOutboundGateway gateway = new RedisQueueOutboundGateway("batch.requests", connectionFactory);
+	public AmqpOutboundEndpoint amqpOutboundEndpoint(AmqpTemplate template) {
+		AmqpOutboundEndpoint endpoint = new AmqpOutboundEndpoint(template);
 
-		gateway.setOutputChannel(inboundStaging());
-		gateway.setReceiveTimeout(60000000);
+		endpoint.setExpectReply(true);
+		endpoint.setOutputChannel(inboundStaging());
 
-		return gateway;
+		DefaultAmqpHeaderMapper headerMapper = new DefaultAmqpHeaderMapper();
+		headerMapper.setRequestHeaderNames("correlationId", "sequenceNumber", "sequenceSize", "STANDARD_REQUEST_HEADERS");
+		headerMapper.setReplyHeaderNames("correlationId", "sequenceNumber", "sequenceSize", "STANDARD_REQUEST_HEADERS");
+
+		endpoint.setHeaderMapper(headerMapper);
+		endpoint.setRoutingKey("partition.requests");
+
+		return endpoint;
 	}
 
 	@Bean
-	public PollableChannel inboundStaging() {
+	public QueueChannel inboundStaging() {
 		return new QueueChannel();
+	}
+
+	@Bean
+	public Queue requestQueue() {
+		return new Queue("partition.requests", false);
 	}
 
 	@Bean
@@ -131,26 +153,32 @@ public class JobConfiguration implements ApplicationContextAware {
 	}
 
 	@Bean
-	public RedisMessageListenerContainer container(RedisConnectionFactory connectionFactory) {
-		RedisMessageListenerContainer container =
-				new RedisMessageListenerContainer();
+	public AmqpInboundGateway inbound(SimpleMessageListenerContainer listenerContainer) {
+		AmqpInboundGateway gateway = new AmqpInboundGateway(listenerContainer);
 
-		container.setConnectionFactory(connectionFactory);
-		container.afterPropertiesSet();
+		gateway.setRequestChannel(inboundRequests());
+		gateway.setReplyChannel(outboundStaging());
+		gateway.setRequestTimeout(60000000l);
+		gateway.setReplyTimeout(60000000l);
 
-		return container;
+		DefaultAmqpHeaderMapper headerMapper = new DefaultAmqpHeaderMapper();
+		headerMapper.setRequestHeaderNames("correlationId", "sequenceNumber", "sequenceSize", "STANDARD_REQUEST_HEADERS");
+		headerMapper.setReplyHeaderNames("correlationId", "sequenceNumber", "sequenceSize", "STANDARD_REQUEST_HEADERS");
+
+		gateway.setHeaderMapper(headerMapper);
+		gateway.afterPropertiesSet();
+
+		return gateway;
 	}
 
 	@Bean
-	public RedisQueueInboundGateway redisInbound(RedisConnectionFactory connectionFactory) {
-		RedisQueueInboundGateway inbound = new RedisQueueInboundGateway("batch.requests", connectionFactory);
+	public SimpleMessageListenerContainer container(ConnectionFactory connectionFactory) {
+		SimpleMessageListenerContainer container =
+				new SimpleMessageListenerContainer(connectionFactory);
+		container.setQueueNames("partition.requests");
+		container.setConcurrentConsumers(3);
 
-		inbound.setRequestChannel(inboundRequests());
-		inbound.setReplyChannel(outboundStaging());
-		inbound.setReceiveTimeout(60000000l);
-		inbound.setSerializer(new JdkSerializationRedisSerializer());
-
-		return inbound;
+		return container;
 	}
 
 	@Bean
@@ -175,15 +203,6 @@ public class JobConfiguration implements ApplicationContextAware {
 		stepExecutionRequestHandler.setJobExplorer(this.jobExplorer);
 
 		return stepExecutionRequestHandler;
-	}
-
-	@Bean
-	public MessagingTemplate messageTemplate() {
-		MessagingTemplate messagingTemplate = new MessagingTemplate(outboundRequests());
-
-		messagingTemplate.setReceiveTimeout(60000000l);
-
-		return messagingTemplate;
 	}
 
 	@Bean(name = PollerMetadata.DEFAULT_POLLER)

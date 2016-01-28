@@ -53,15 +53,14 @@ import org.springframework.context.annotation.Configuration;
 import org.springframework.core.task.SimpleAsyncTaskExecutor;
 import org.springframework.integration.amqp.inbound.AmqpInboundGateway;
 import org.springframework.integration.amqp.outbound.AmqpOutboundEndpoint;
-import org.springframework.integration.amqp.support.DefaultAmqpHeaderMapper;
-import org.springframework.integration.annotation.Aggregator;
 import org.springframework.integration.annotation.ServiceActivator;
-import org.springframework.integration.channel.DirectChannel;
 import org.springframework.integration.channel.ExecutorChannel;
+import org.springframework.integration.channel.NullChannel;
 import org.springframework.integration.channel.QueueChannel;
 import org.springframework.integration.core.MessagingTemplate;
 import org.springframework.integration.dsl.channel.MessageChannels;
 import org.springframework.integration.scheduling.PollerMetadata;
+import org.springframework.messaging.PollableChannel;
 import org.springframework.scheduling.support.PeriodicTrigger;
 
 /**
@@ -84,15 +83,17 @@ public class JobConfiguration implements ApplicationContextAware {
 
 	private ApplicationContext applicationContext;
 
+	private static final int GRID_SIZE = 4;
+
 	@Bean
-	@Aggregator(inputChannel = "inboundStaging", sendPartialResultsOnExpiry = "true", sendTimeout = "60000000")
 	public PartitionHandler partitionHandler() throws Exception {
 		MessageChannelPartitionHandler partitionHandler = new MessageChannelPartitionHandler();
 
 		partitionHandler.setStepName("slaveStep");
-		partitionHandler.setGridSize(4);
+		partitionHandler.setGridSize(GRID_SIZE);
 		partitionHandler.setMessagingOperations(messageTemplate());
-		partitionHandler.setReplyChannel(inboundStaging());
+		partitionHandler.setPollInterval(5000l);
+		partitionHandler.setJobExplorer(this.jobExplorer);
 
 		partitionHandler.afterPropertiesSet();
 
@@ -119,21 +120,11 @@ public class JobConfiguration implements ApplicationContextAware {
 		AmqpOutboundEndpoint endpoint = new AmqpOutboundEndpoint(template);
 
 		endpoint.setExpectReply(true);
-		endpoint.setOutputChannel(inboundStaging());
+		endpoint.setOutputChannel(inboundRequests());
 
-		DefaultAmqpHeaderMapper headerMapper = new DefaultAmqpHeaderMapper();
-		headerMapper.setRequestHeaderNames("correlationId", "sequenceNumber", "sequenceSize", "STANDARD_REQUEST_HEADERS");
-		headerMapper.setReplyHeaderNames("correlationId", "sequenceNumber", "sequenceSize", "STANDARD_REQUEST_HEADERS");
-
-		endpoint.setHeaderMapper(headerMapper);
 		endpoint.setRoutingKey("partition.requests");
 
 		return endpoint;
-	}
-
-	@Bean
-	public QueueChannel inboundStaging() {
-		return new QueueChannel();
 	}
 
 	@Bean
@@ -157,15 +148,8 @@ public class JobConfiguration implements ApplicationContextAware {
 		AmqpInboundGateway gateway = new AmqpInboundGateway(listenerContainer);
 
 		gateway.setRequestChannel(inboundRequests());
-		gateway.setReplyChannel(outboundStaging());
 		gateway.setRequestTimeout(60000000l);
-		gateway.setReplyTimeout(60000000l);
 
-		DefaultAmqpHeaderMapper headerMapper = new DefaultAmqpHeaderMapper();
-		headerMapper.setRequestHeaderNames("correlationId", "sequenceNumber", "sequenceSize", "STANDARD_REQUEST_HEADERS");
-		headerMapper.setReplyHeaderNames("correlationId", "sequenceNumber", "sequenceSize", "STANDARD_REQUEST_HEADERS");
-
-		gateway.setHeaderMapper(headerMapper);
 		gateway.afterPropertiesSet();
 
 		return gateway;
@@ -176,14 +160,14 @@ public class JobConfiguration implements ApplicationContextAware {
 		SimpleMessageListenerContainer container =
 				new SimpleMessageListenerContainer(connectionFactory);
 		container.setQueueNames("partition.requests");
-		container.setConcurrentConsumers(3);
+		container.setConcurrentConsumers(GRID_SIZE);
 
 		return container;
 	}
 
 	@Bean
-	public DirectChannel outboundStaging() {
-		return new DirectChannel();
+	public PollableChannel outboundStaging() {
+		return new NullChannel();
 	}
 
 	@Bean
@@ -227,7 +211,7 @@ public class JobConfiguration implements ApplicationContextAware {
 		MySqlPagingQueryProvider queryProvider = new MySqlPagingQueryProvider();
 		queryProvider.setSelectClause("id, firstName, lastName, birthdate");
 		queryProvider.setFromClause("from customer");
-		queryProvider.setWhereClause("where id >= " + minValue + " and id < " + maxValue);
+		queryProvider.setWhereClause("where id >= " + minValue + " and id <= " + maxValue);
 
 		Map<String, Order> sortKeys = new HashMap<>(1);
 

@@ -11,6 +11,6 @@ import org.springframework.integration.annotation.IntegrationComponentScan;
 public class RemotePartitioningApplication {
 
 	public static void main(String[] args) {
-		SpringApplication.run(RemotePartitioningApplication.class, args);
+		SpringApplication.exit(SpringApplication.run(RemotePartitioningApplication.class, args));
 	}
 }
